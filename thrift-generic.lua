@@ -2,25 +2,10 @@
 -- wireshark-thrift-dissector
 -- This code is licensed under MIT license (see LICENSE for details)
 --
--------------------------------------------------------------------------------
---- configuration
-local default_settings = {
-    port = 9090,
-}
 
 -------------------------------------------------------------------------------
---- protocols
-local theader_protocol = Proto("theader", "Thrift Header Protocol")
-local tbinary_protocol = Proto("tbinary", "Thrift Binary Protocol")
-
 -------------------------------------------------------------------------------
 --- lookup tables
-local msgtype_valstr = {}
-msgtype_valstr[1] = "CALL"
-msgtype_valstr[2] = "REPLY"
-msgtype_valstr[3] = "EXCEPTION"
-msgtype_valstr[4] = "ONEWAY"
-
 local fieldtype_valstr = {}
 fieldtype_valstr[0] = "STOP"
 fieldtype_valstr[1] = "VOID"
@@ -45,17 +30,6 @@ THRIFT_VERSION_1 = -2147418112
 THRIFT_HEADER_MAGIC = 0x0FFF
 THRIFT_HEADER_TYPE_KV = 0x01
 THRIFT_TYPE_MASK = 0x000000ff
-
--------------------------------------------------------------------------------
---- fields
-local tbinary_fields = {
-    msg_type = ProtoField.uint8("tbinary.msgtype", "Message Type", base.DEC, msgtype_valstr),
-    msg_type = ProtoField.uint8("tbinary.msgtype", "Message Type", base.DEC, msgtype_valstr),
-    msg_name = ProtoField.string("tbinary.msgname", "Message Name"),
-    msg_seq = ProtoField.uint32("tbinary.msgseq", "Message Sequence", base.DEC),
-}
-
-tbinary_protocol.fields = tbinary_fields
 
 -------------------------------------------------------------------------------
 --- ThriftBuffer is a stateful buffer helper
@@ -250,114 +224,32 @@ function decode_tfields(buf, tree)
     return tbuf.pos
 end
 
--------------------------------------------------------------------------------
---- root tbinary dissector. will dissect a unframed tbinary message
-function tbinary_protocol.dissector(buffer, pinfo, tree)
-    local tbuf = ThriftBuffer:new(buffer)
-    local sz = tbuf(4):int()
-
-    if sz < 0 then
-        local version = bit32.band(sz, THRIFT_VERSION_MASK)
-        if not bit32.btest(version, THRIFT_VERSION_1) then
-            return 0
-        end
-
-        local type = bit32.band(sz, THRIFT_TYPE_MASK)
-        tree:add(tbinary_fields.msg_type, type)
-
-        local name_pos = tbuf.pos
-        local name = tbuf:string()
-        if name:len() > 0 then
-            tree:add(tbinary_fields.msg_name, buffer(name_pos, tbuf.pos-name_pos), name)
-        end
-
-        local seq_pos = tbuf.pos
-        local seqid = tbuf(4):int()
-        tree:add(tbinary_fields.msg_seq, buffer(seq_pos, 4), seqid)
-    else
-        -- TODO(eac): implement me
-        print("non-versioned tbinary protocol unimplemented")
-    end
-
-    decode_tfields(buffer(tbuf.pos, buffer:len()-tbuf.pos), tree)
-end
 
 -------------------------------------------------------------------------------
---- root theader dissector. will dissect a framed theader message, chaining
---- the payload into the tbinary dissector
-function theader_protocol.dissector(buffer, pinfo, tree)
-    if buffer:len() == 0 then return end
+--- protocol
+local tstruct_protocol = Proto("thriftstruct", "Single Thrift Struct Encoded In Binary Protocol")
 
-    pinfo.cols.protocol = theader_protocol.name
+local tstruct_fields = {
+    struct_name = ProtoField.string("thriftstruct.name", "Struct Name"),
+    struct_bytesize = ProtoField.uint32("thriftstruct.bytesize", "Struct Serialized Size In Bytes", base.DEC),
+    struct_fields = ProtoField.none("thriftstruct.fields", "Struct Fields"),
+}
 
-    local subtree = tree:add(theader_protocol, buffer(), "Thrift Protocol Data")
+tstruct_protocol.fields = tstruct_fields
 
-    local frame_size = buffer(0, 4):int()
+-------------------------------------------------------------------------------
+--- root thriftstruct dissector. will dissect a unframed thriftstruct message
+function tstruct_protocol.dissector(buffer, pinfo, tree)
+    local subtree = tree:add(tstruct_protocol, buffer(), "Serialized Thrift Struct Data")
+    -- TODO(ugo): maybe we could get this from the tree? Or, how do you deal with the pinfo?
+    --subtree:add(tstruct_fields.struct_name, "ugo name:[" .. tostring(pinfo.http2.header.name) .. "] [" .. tostring(pinfo.http2.header) .. "] value:[" .. tostring(pinfo.http2.header.value) )
+    subtree:add(tstruct_fields.struct_bytesize, buffer:len())
+    local subsubtree = subtree:add(tstruct_fields.struct_fields)
 
-    if (buffer:len() - 4) < frame_size then
-        pinfo.desegment_len = frame_size - (buffer:len() - 4)
-        pinfo.desegment_offset = 0
-        return
-    end
-
-    local framebuf = buffer(4, frame_size):tvb()
-
-    local tb = ThriftBuffer:new(framebuf)
-    local version = framebuf(0, 4):int()
-    if bit32.rshift(version, 16) == THRIFT_HEADER_MAGIC then
-        local flags, seq_id, header_length, end_of_headers, protocol_id, transform_count = nil
-        tb:seek(2)
-
-        flags = tb(2):uint()
-        seq_id = tb(4):int()
-        header_length = tb(2):uint() * 4
-        end_of_headers = tb.pos + header_length
-
-        protocol_id = tb:varint()
-        transform_count = tb:varint()
-
-        -- TODO(eac): try to implement the gzip transform?
-        local transforms = {}
-        for i = 1, transform_count do
-            local transform_id = tb:varint()
-            table.insert(transforms, transform_id)
-        end
-
-        local headers_tree = subtree:add(framebuf(tb.pos, header_length), "Headers")
-        while tb.pos < end_of_headers do
-            local header_type = tb:varint()
-            if header_type == THRIFT_HEADER_TYPE_KV then
-                local count = tb:varint()
-                for i = 1, count do
-                    local header_start = tb.pos
-                    local key = tb:varstring()
-                    local val_len = tb:varint()
-
-                    if val_len > 0 then
-                        local value_tree = headers_tree:add(framebuf(header_start, (tb.pos-header_start) + val_len), key)
-                        -- attempt to read value as thrift
-                        local val_range = framebuf(tb.pos, val_len)
-                        local val_buf = val_range:tvb()
-                        if decode_tfields(val_buf, value_tree) ~= 0 then
-                        else
-                            local value = val_range:string()
-                            value_tree:add(framebuf(tb.pos, val_len), value)
-                        end
-
-                        tb:seek(tb.pos + val_len)
-                    else
-                        print("empty")
-                    end
-                end
-            end
-        end
-
-        remaining_buf = framebuf(end_of_headers, framebuf:len()-end_of_headers)
-        local payload_tree = subtree:add(tbinary_protocol, remaining_buf, "Payload")
-        Dissector.get("tbinary"):call(remaining_buf:tvb(), pinfo, payload_tree)
-    end
+    decode_tfields(buffer, subsubtree)
 end
 
 -------------------------------------------------------------------------------
 --- dissector registration
-DissectorTable.get("tcp.port"):add(default_settings.port, theader_protocol)
+DissectorTable.get("grpc_message_type"):set("application/grpc", tstruct_protocol)
+DissectorTable.get("grpc_message_type"):add("application/grpc+thrift", tstruct_protocol)
